@@ -408,6 +408,64 @@ def extract_google_ads_adgroup_daily(
 
     return rows
 
+def extract_google_ads_ads(
+    config: dict,
+    access_token: str,
+    customer_id: str
+) -> list[dict]:
+    url = f"https://googleads.googleapis.com/v23/customers/{customer_id}/googleAds:search"
+
+    query = """
+        SELECT
+          campaign.id,
+          ad_group.id,
+          ad_group_ad.ad.id,
+          ad_group_ad.status,
+          ad_group_ad.ad.type,
+          ad_group_ad.ad.final_urls,
+          ad_group_ad.ad.display_url
+        FROM ad_group_ad
+            WHERE ad_group_ad.status = 'ENABLED'
+        ORDER BY campaign.id, ad_group.id, ad_group_ad.ad.id
+    """
+
+    response = requests.post(
+        url,
+        headers=build_google_ads_headers(config, access_token),
+        json={"query": query},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise ValueError(f"Google Ads ad snapshot query failed: {response.text}")
+
+    payload = response.json()
+    results = payload.get("results", [])
+    load_datetime = datetime.utcnow().replace(microsecond=0)
+
+    rows = []
+    for r in results:
+        campaign = r.get("campaign", {})
+        ad_group = r.get("adGroup", {})
+        ad_group_ad = r.get("adGroupAd", {})
+        ad = ad_group_ad.get("ad", {})
+
+        rows.append(
+            {
+                "LoadDateTime": load_datetime,
+                "CustomerId": int(customer_id),
+                "CampaignId": int(campaign["id"]) if campaign.get("id") else None,
+                "AdGroupId": int(ad_group["id"]) if ad_group.get("id") else None,
+                "AdId": int(ad["id"]) if ad.get("id") else None,
+                "AdStatus": ad_group_ad.get("status"),
+                "AdType": ad.get("type"),
+                "DisplayUrl": ad.get("displayUrl"),
+                "FinalUrls": ",".join(ad.get("finalUrls", [])) if ad.get("finalUrls") else None,
+            }
+        )
+
+    return rows
+
 # =========================================================
 # SQL LOADS
 # =========================================================
@@ -744,6 +802,67 @@ def insert_google_ads_adgroup_daily(rows: list[dict], sql_config: dict):
         cursor.close()
         conn.close()
 
+def replace_google_ads_ads(
+    rows: list[dict],
+    customer_id: str,
+    sql_config: dict
+):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            DELETE FROM stg.GoogleAdsAd
+            WHERE CustomerId = ?
+            """,
+            int(customer_id)
+        )
+
+        insert_sql = """
+            INSERT INTO stg.GoogleAdsAd
+            (
+                LoadDateTime,
+                CustomerId,
+                CampaignId,
+                AdGroupId,
+                AdId,
+                AdStatus,
+                AdType,
+                DisplayUrl,
+                FinalUrls
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        data = [
+            (
+                r["LoadDateTime"],
+                r["CustomerId"],
+                r["CampaignId"],
+                r["AdGroupId"],
+                r["AdId"],
+                r["AdStatus"],
+                r["AdType"],
+                r["DisplayUrl"],
+                r["FinalUrls"],
+            )
+            for r in rows
+        ]
+
+        if data:
+            cursor.fast_executemany = True
+            cursor.executemany(insert_sql, data)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
 # =========================================================
 # SHARED LOAD ORCHESTRATOR
 # =========================================================
@@ -782,6 +901,18 @@ def run_google_ads_campaign_load(
     )
     replace_google_ads_adgroups(
         rows=adgroup_rows,
+        customer_id=customer_id,
+        sql_config=sql_config,
+    )
+
+    ad_rows = extract_google_ads_ads(
+    config=config,
+    access_token=access_token,
+    customer_id=customer_id,
+    )
+
+    replace_google_ads_ads(
+        rows=ad_rows,
         customer_id=customer_id,
         sql_config=sql_config,
     )
