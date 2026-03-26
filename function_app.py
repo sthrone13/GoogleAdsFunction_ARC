@@ -288,6 +288,125 @@ def extract_google_ads_campaign_daily(
 
     return rows
 
+def extract_google_ads_adgroups(
+    config: dict,
+    access_token: str,
+    customer_id: str
+) -> list[dict]:
+    url = f"https://googleads.googleapis.com/v23/customers/{customer_id}/googleAds:search"
+
+    query = """
+        SELECT
+          campaign.id,
+          campaign.name,
+          ad_group.id,
+          ad_group.name,
+          ad_group.status,
+          campaign.advertising_channel_type
+        FROM ad_group
+        ORDER BY campaign.id, ad_group.id
+    """
+
+    response = requests.post(
+        url,
+        headers=build_google_ads_headers(config, access_token),
+        json={"query": query},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise ValueError(f"Google Ads ad group snapshot query failed: {response.text}")
+
+    payload = response.json()
+    results = payload.get("results", [])
+    load_datetime = datetime.utcnow().replace(microsecond=0)
+
+    rows = []
+    for r in results:
+        campaign = r.get("campaign", {})
+        ad_group = r.get("adGroup", {})
+
+        rows.append(
+            {
+                "LoadDateTime": load_datetime,
+                "CustomerId": int(customer_id),
+                "CampaignId": int(campaign["id"]) if campaign.get("id") else None,
+                "AdGroupId": int(ad_group["id"]) if ad_group.get("id") else None,
+                "CampaignName": campaign.get("name"),
+                "AdGroupName": ad_group.get("name"),
+                "AdGroupStatus": ad_group.get("status"),
+                "AdvertisingChannelType": campaign.get("advertisingChannelType"),
+            }
+        )
+
+    return rows
+
+
+def extract_google_ads_adgroup_daily(
+    config: dict,
+    access_token: str,
+    customer_id: str,
+    start_date: str,
+    end_date: str
+) -> list[dict]:
+    url = f"https://googleads.googleapis.com/v23/customers/{customer_id}/googleAds:search"
+
+    query = f"""
+        SELECT
+          campaign.id,
+          ad_group.id,
+          segments.date,
+          metrics.impressions,
+          metrics.clicks,
+          metrics.cost_micros,
+          metrics.conversions,
+          metrics.conversions_value
+        FROM ad_group
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+        ORDER BY segments.date, campaign.id, ad_group.id
+    """
+
+    response = requests.post(
+        url,
+        headers=build_google_ads_headers(config, access_token),
+        json={"query": query},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise ValueError(f"Google Ads ad group daily query failed: {response.text}")
+
+    payload = response.json()
+    results = payload.get("results", [])
+    load_datetime = datetime.utcnow().replace(microsecond=0)
+
+    rows = []
+    for r in results:
+        campaign = r.get("campaign", {})
+        ad_group = r.get("adGroup", {})
+        metrics = r.get("metrics", {})
+        segments = r.get("segments", {})
+
+        report_date = None
+        if segments.get("date"):
+            report_date = datetime.strptime(segments["date"], "%Y-%m-%d").date()
+
+        rows.append(
+            {
+                "LoadDateTime": load_datetime,
+                "CustomerId": int(customer_id),
+                "CampaignId": int(campaign["id"]) if campaign.get("id") else None,
+                "AdGroupId": int(ad_group["id"]) if ad_group.get("id") else None,
+                "ReportDate": report_date,
+                "Impressions": int(metrics["impressions"]) if metrics.get("impressions") is not None else None,
+                "Clicks": int(metrics["clicks"]) if metrics.get("clicks") is not None else None,
+                "CostMicros": int(metrics["costMicros"]) if metrics.get("costMicros") is not None else None,
+                "Conversions": float(metrics["conversions"]) if metrics.get("conversions") is not None else None,
+                "ConversionValue": float(metrics["conversionsValue"]) if metrics.get("conversionsValue") is not None else None,
+            }
+        )
+
+    return rows
 
 # =========================================================
 # SQL LOADS
@@ -480,6 +599,150 @@ def insert_google_ads_campaign_daily(rows: list[dict], sql_config: dict):
         cursor.close()
         conn.close()
 
+def replace_google_ads_adgroups(
+    rows: list[dict],
+    customer_id: str,
+    sql_config: dict
+):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            DELETE FROM stg.GoogleAdsAdGroup
+            WHERE CustomerId = ?
+            """,
+            int(customer_id)
+        )
+
+        insert_sql = """
+            INSERT INTO stg.GoogleAdsAdGroup
+            (
+                LoadDateTime,
+                CustomerId,
+                CampaignId,
+                AdGroupId,
+                CampaignName,
+                AdGroupName,
+                AdGroupStatus,
+                AdvertisingChannelType
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        data = [
+            (
+                r["LoadDateTime"],
+                r["CustomerId"],
+                r["CampaignId"],
+                r["AdGroupId"],
+                r["CampaignName"],
+                r["AdGroupName"],
+                r["AdGroupStatus"],
+                r["AdvertisingChannelType"],
+            )
+            for r in rows
+        ]
+
+        if data:
+            cursor.fast_executemany = True
+            cursor.executemany(insert_sql, data)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def delete_google_ads_adgroup_daily_window(
+    customer_id: str,
+    start_date: str,
+    end_date: str,
+    sql_config: dict
+):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            DELETE
+            FROM stg.GoogleAdsAdGroupDaily
+            WHERE CustomerId = ?
+              AND ReportDate BETWEEN ? AND ?
+            """,
+            int(customer_id),
+            start_date,
+            end_date,
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def insert_google_ads_adgroup_daily(rows: list[dict], sql_config: dict):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        insert_sql = """
+            INSERT INTO stg.GoogleAdsAdGroupDaily
+            (
+                LoadDateTime,
+                CustomerId,
+                CampaignId,
+                AdGroupId,
+                ReportDate,
+                Impressions,
+                Clicks,
+                CostMicros,
+                Conversions,
+                ConversionValue
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        data = [
+            (
+                r["LoadDateTime"],
+                r["CustomerId"],
+                r["CampaignId"],
+                r["AdGroupId"],
+                r["ReportDate"],
+                r["Impressions"],
+                r["Clicks"],
+                r["CostMicros"],
+                r["Conversions"],
+                r["ConversionValue"],
+            )
+            for r in rows
+        ]
+
+        if data:
+            cursor.fast_executemany = True
+            cursor.executemany(insert_sql, data)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
 
 # =========================================================
 # SHARED LOAD ORCHESTRATOR
@@ -512,6 +775,17 @@ def run_google_ads_campaign_load(
         sql_config=sql_config,
     )
 
+    adgroup_rows = extract_google_ads_adgroups(
+        config=config,
+        access_token=access_token,
+        customer_id=customer_id,
+    )
+    replace_google_ads_adgroups(
+        rows=adgroup_rows,
+        customer_id=customer_id,
+        sql_config=sql_config,
+    )
+
     daily_rows = extract_google_ads_campaign_daily(
         config=config,
         access_token=access_token,
@@ -527,13 +801,30 @@ def run_google_ads_campaign_load(
     )
     insert_google_ads_campaign_daily(daily_rows, sql_config)
 
+    adgroup_daily_rows = extract_google_ads_adgroup_daily(
+        config=config,
+        access_token=access_token,
+        customer_id=customer_id,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+    )
+    delete_google_ads_adgroup_daily_window(
+        customer_id=customer_id,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        sql_config=sql_config,
+    )
+    insert_google_ads_adgroup_daily(adgroup_daily_rows, sql_config)
+
     return {
         "customer_id": customer_id,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "account_row_count": len(account_rows),
         "campaign_snapshot_row_count": len(campaign_rows),
-        "daily_row_count": len(daily_rows),
+        "adgroup_snapshot_row_count": len(adgroup_rows),
+        "campaign_daily_row_count": len(daily_rows),
+        "adgroup_daily_row_count": len(adgroup_daily_rows),
     }
 
 
