@@ -4,7 +4,7 @@ import json
 import os
 import requests
 import pyodbc
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -19,9 +19,10 @@ def get_google_ads_config():
         "client_id": os.environ.get("GOOGLE_ADS_CLIENT_ID"),
         "client_secret": os.environ.get("GOOGLE_ADS_CLIENT_SECRET"),
         "refresh_token": os.environ.get("GOOGLE_ADS_REFRESH_TOKEN"),
+        "login_customer_id": os.environ.get("GOOGLE_ADS_LOGIN_CUSTOMER_ID"),
     }
 
-    missing = [k for k, v in config.items() if not v]
+    missing = [k for k, v in config.items() if not v and k != "login_customer_id"]
     if missing:
         raise ValueError(f"Missing required Google Ads config values: {missing}")
 
@@ -56,6 +57,7 @@ def get_google_ads_customer_ids() -> list[str]:
         raise ValueError("Missing required config value: GOOGLE_ADS_CUSTOMER_IDS")
 
     return customer_ids
+
 
 
 def build_sql_connection_string(sql_config: dict) -> str:
@@ -96,11 +98,22 @@ def get_google_access_token(config: dict) -> str:
 
 
 def build_google_ads_headers(config: dict, access_token: str) -> dict:
-    return {
+    headers = {
         "Authorization": f"Bearer {access_token}",
         "developer-token": config["developer_token"],
         "Content-Type": "application/json",
     }
+
+    #if config.get("login_customer_id"):
+     #   headers["login-customer-id"] = str(config["login_customer_id"]).replace("-", "")
+
+    # 🔴 ADD THIS
+    logging.info(
+        "Google Ads headers built | login_customer_id=%s",
+        headers.get("login-customer-id")
+    )
+
+    return headers
 
 
 # =========================================================
@@ -465,7 +478,257 @@ def extract_google_ads_ads(
         )
 
     return rows
+# =========================
+# GOOGLE ADS - CLICKS
+# =========================
 
+def extract_google_ads_clicks(
+    config: dict,
+    access_token: str,
+    customer_id: str,
+    report_date: str
+) -> list[dict]:
+    url = f"https://googleads.googleapis.com/v23/customers/{customer_id}/googleAds:search"
+
+    query = f"""
+        SELECT
+          customer.id,
+          segments.date,
+          click_view.gclid,
+          campaign.id,
+          campaign.name,
+          ad_group.id,
+          ad_group.name,
+          click_view.ad_group_ad,
+          click_view.keyword_info.text,
+          click_view.keyword_info.match_type,
+          segments.device,
+          segments.ad_network_type,
+          segments.click_type,
+          metrics.clicks
+        FROM click_view
+        WHERE segments.date = '{report_date}'
+    """
+
+    response = requests.post(
+        url,
+        headers=build_google_ads_headers(config, access_token),
+        json={"query": query},
+        timeout=60,
+    )
+
+    if not response.ok:
+        raise ValueError(f"Google Ads click query failed: {response.text}")
+
+    payload = response.json()
+    results = payload.get("results", [])
+
+    rows = []
+    for r in results:
+        customer = r.get("customer", {})
+        campaign = r.get("campaign", {})
+        ad_group = r.get("adGroup", {})
+        click_view = r.get("clickView", {})
+        keyword_info = click_view.get("keywordInfo", {})
+        segments = r.get("segments", {})
+        metrics = r.get("metrics", {})
+
+        gclid = click_view.get("gclid")
+        if not gclid:
+            continue
+
+        ad_group_ad_resource = click_view.get("adGroupAd")
+        ad_id = None
+        if ad_group_ad_resource:
+            try:
+                ad_id = int(str(ad_group_ad_resource).split("~")[-1])
+            except Exception:
+                ad_id = None
+
+        click_date = None
+        if segments.get("date"):
+            click_date = datetime.strptime(segments["date"], "%Y-%m-%d").date()
+
+        rows.append(
+            {
+                "CustomerId": int(customer["id"]) if customer.get("id") else int(customer_id),
+                "ClickDate": click_date,
+                "Gclid": gclid,
+                "CampaignId": int(campaign["id"]) if campaign.get("id") else None,
+                "CampaignName": campaign.get("name"),
+                "AdGroupId": int(ad_group["id"]) if ad_group.get("id") else None,
+                "AdGroupName": ad_group.get("name"),
+                "AdId": ad_id,
+                "KeywordText": keyword_info.get("text"),
+                "KeywordMatchType": keyword_info.get("matchType"),
+                "Device": segments.get("device"),
+                "AdNetworkType": segments.get("adNetworkType"),
+                "ClickType": segments.get("clickType"),
+                "Clicks": int(metrics["clicks"]) if metrics.get("clicks") is not None else 0,
+                "SourceSystem": "GoogleAds",
+            }
+        )
+
+    return rows
+
+
+def delete_google_ads_click_window(
+    customer_id: str,
+    click_date: str,
+    sql_config: dict
+):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            DELETE
+            FROM stg.GoogleAdsClick
+            WHERE CustomerId = ?
+              AND ClickDate = ?
+            """,
+            int(customer_id),
+            click_date,
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def insert_google_ads_clicks(rows: list[dict], sql_config: dict):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        insert_sql = """
+            INSERT INTO stg.GoogleAdsClick
+            (
+                CustomerId,
+                ClickDate,
+                Gclid,
+                CampaignId,
+                CampaignName,
+                AdGroupId,
+                AdGroupName,
+                AdId,
+                KeywordText,
+                KeywordMatchType,
+                Device,
+                AdNetworkType,
+                ClickType,
+                Clicks,
+                SourceSystem
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+
+        data = [
+            (
+                r["CustomerId"],
+                r["ClickDate"],
+                r["Gclid"],
+                r["CampaignId"],
+                r["CampaignName"],
+                r["AdGroupId"],
+                r["AdGroupName"],
+                r["AdId"],
+                r["KeywordText"],
+                r["KeywordMatchType"],
+                r["Device"],
+                r["AdNetworkType"],
+                r["ClickType"],
+                r["Clicks"],
+                r["SourceSystem"],
+            )
+            for r in rows
+        ]
+
+        if data:
+            cursor.fast_executemany = True
+            cursor.executemany(insert_sql, data)
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def execute_load_fact_google_ads_click(
+    customer_id: str,
+    click_date: str,
+    sql_config: dict
+):
+    conn = pyodbc.connect(build_sql_connection_string(sql_config))
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            "EXEC dbo.LoadFactGoogleAdsClick ?, ?",
+            int(customer_id),
+            click_date,
+        )
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def run_google_ads_click_load(
+    customer_id: str,
+    report_date: date,
+) -> dict:
+    config = get_google_ads_config()
+    sql_config = get_sql_config()
+    access_token = get_google_access_token(config)
+
+    report_date_str = report_date.isoformat()
+
+    click_rows = extract_google_ads_clicks(
+        config=config,
+        access_token=access_token,
+        customer_id=customer_id,
+        report_date=report_date_str,
+    )
+
+    delete_google_ads_click_window(
+        customer_id=customer_id,
+        click_date=report_date_str,
+        sql_config=sql_config,
+    )
+
+    insert_google_ads_clicks(
+        rows=click_rows,
+        sql_config=sql_config,
+    )
+
+    execute_load_fact_google_ads_click(
+        customer_id=customer_id,
+        click_date=report_date_str,
+        sql_config=sql_config,
+    )
+
+    return {
+        "customer_id": customer_id,
+        "report_date": report_date_str,
+        "click_row_count": len(click_rows),
+    }
 # =========================================================
 # SQL LOADS
 # =========================================================
@@ -564,8 +827,10 @@ def replace_google_ads_campaigns(
             for r in rows
         ]
 
-        cursor.fast_executemany = True
-        cursor.executemany(insert_sql, data)
+        if data:
+            cursor.fast_executemany = True
+            cursor.executemany(insert_sql, data)
+
         conn.commit()
 
     except Exception:
@@ -645,8 +910,10 @@ def insert_google_ads_campaign_daily(rows: list[dict], sql_config: dict):
             for r in rows
         ]
 
-        cursor.fast_executemany = True
-        cursor.executemany(insert_sql, data)
+        if data:
+            cursor.fast_executemany = True
+            cursor.executemany(insert_sql, data)
+
         conn.commit()
 
     except Exception:
@@ -963,6 +1230,7 @@ def run_google_ads_campaign_load(
 # HTTP FUNCTION
 # =========================================================
 
+
 @app.route(route="GoogleAdsCampaignDaily")
 def GoogleAdsCampaignDaily(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("GoogleAdsCampaignDaily function processed a request.")
@@ -1123,3 +1391,155 @@ def GoogleAdsCampaignDailyTimer(mytimer: func.TimerRequest) -> None:
     failed_customers = [r for r in overall_results if r["status"] == "error"]
     if failed_customers:
         raise RuntimeError(f"One or more customer loads failed: {json.dumps(failed_customers)}")
+    
+
+# =========================================================
+# HTTP FUNCTION - CLICKS
+# =========================================================
+
+@app.route(route="GoogleAdsClickDaily")
+def GoogleAdsClickDaily(req: func.HttpRequest) -> func.HttpResponse:
+    logging.info("GoogleAdsClickDaily function processed a request.")
+
+    customer_id = req.params.get("customer_id")
+    report_date = req.params.get("report_date")
+
+    if not customer_id or not report_date:
+        try:
+            req_body = req.get_json()
+        except ValueError:
+            req_body = {}
+        else:
+            customer_id = customer_id or req_body.get("customer_id")
+            report_date = report_date or req_body.get("report_date")
+
+    missing = []
+    if not customer_id:
+        missing.append("customer_id")
+    if not report_date:
+        missing.append("report_date")
+
+    if missing:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": "Missing required parameters.",
+                    "missing_parameters": missing,
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        parsed_date = datetime.strptime(report_date, "%Y-%m-%d").date()
+    except ValueError:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": "report_date must be YYYY-MM-DD."
+                }
+            ),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        load_result = run_google_ads_click_load(
+            customer_id=customer_id,
+            report_date=parsed_date,
+        )
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "load_result": load_result
+                }
+            ),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as e:
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": str(e)
+                }
+            ),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+
+# =========================================================
+# TIMER FUNCTION - CLICKS
+# =========================================================
+
+@app.function_name(name="GoogleAdsClickDailyTimer")
+@app.schedule(
+    schedule="0 15 6 * * *",
+    arg_name="mytimer",
+    run_on_startup=False,
+    use_monitor=True
+)
+def GoogleAdsClickDailyTimer(mytimer: func.TimerRequest) -> None:
+    logging.info("GoogleAdsClickDailyTimer function started.")
+
+    yesterday = datetime.utcnow().date() - timedelta(days=1)
+
+    customer_ids = get_google_ads_customer_ids()
+    overall_results = []
+
+    for customer_id in customer_ids:
+        for d in range(0, 3):
+            report_date = yesterday - timedelta(days=d)
+
+            try:
+                load_result = run_google_ads_click_load(
+                    customer_id=customer_id,
+                    report_date=report_date,
+                )
+
+                overall_results.append(
+                    {
+                        "customer_id": customer_id,
+                        "report_date": str(report_date),
+                        "status": "ok",
+                        "load_result": load_result,
+                    }
+                )
+
+                logging.info(
+                    "Google Ads click load completed successfully for customer_id %s, report_date %s: %s",
+                    customer_id,
+                    report_date,
+                    json.dumps(load_result)
+                )
+
+            except Exception as e:
+                overall_results.append(
+                    {
+                        "customer_id": customer_id,
+                        "report_date": str(report_date),
+                        "status": "error",
+                        "message": str(e),
+                    }
+                )
+
+                logging.exception(
+                    "Google Ads click load failed for customer_id %s, report_date %s: %s",
+                    customer_id,
+                    report_date,
+                    str(e)
+                )
+
+    logging.info("Google Ads click load summary: %s", json.dumps(overall_results))
+
+    failed = [r for r in overall_results if r["status"] == "error"]
+    if failed:
+        raise RuntimeError(f"One or more click loads failed: {json.dumps(failed)}")
